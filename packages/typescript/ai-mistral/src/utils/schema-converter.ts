@@ -11,10 +11,12 @@ export function transformNullsToUndefined<T>(obj: T): T {
   }
 
   if (Array.isArray(obj)) {
-    return obj.map((item) => transformNullsToUndefined(item)) as unknown as T
+    return obj
+      .map((item) => transformNullsToUndefined(item))
+      .filter((item) => item !== undefined) as unknown as T
   }
 
-  if (typeof obj === 'object') {
+  if (typeof obj === 'object' && Object.getPrototypeOf(obj) === Object.prototype) {
     const result: Record<string, unknown> = {}
     for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
       const transformed = transformNullsToUndefined(value)
@@ -55,17 +57,41 @@ export function makeMistralStructuredOutputCompatible(
       const wasOptional = !originalRequired.includes(propName)
 
       if (prop.type === 'object' && prop.properties) {
-        properties[propName] = makeMistralStructuredOutputCompatible(
+        const converted = makeMistralStructuredOutputCompatible(
           prop,
           prop.required || [],
         )
+        if (wasOptional) {
+          properties[propName] = {
+            ...converted,
+            type: Array.isArray(converted.type)
+              ? converted.type.includes('null')
+                ? converted.type
+                : [...converted.type, 'null']
+              : [converted.type, 'null'],
+          }
+        } else {
+          properties[propName] = converted
+        }
       } else if (prop.type === 'array' && prop.items) {
-        properties[propName] = {
+        const converted = {
           ...prop,
           items: makeMistralStructuredOutputCompatible(
             prop.items,
             prop.items.required || [],
           ),
+        }
+        if (wasOptional) {
+          properties[propName] = {
+            ...converted,
+            type: Array.isArray(converted.type)
+              ? converted.type.includes('null')
+                ? converted.type
+                : [...converted.type, 'null']
+              : [converted.type, 'null'],
+          }
+        } else {
+          properties[propName] = converted
         }
       } else if (wasOptional) {
         if (prop.type && !Array.isArray(prop.type)) {
@@ -78,6 +104,8 @@ export function makeMistralStructuredOutputCompatible(
             ...prop,
             type: [...prop.type, 'null'],
           }
+        } else if (!prop.type) {
+          properties[propName] = { anyOf: [prop, { type: 'null' }] }
         }
       }
     }

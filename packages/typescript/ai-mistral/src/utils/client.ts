@@ -1,4 +1,4 @@
-import { Mistral } from '@mistralai/mistralai'
+import { Mistral, HTTPClient } from '@mistralai/mistralai'
 
 export interface MistralClientConfig {
   /** Mistral API key. */
@@ -9,17 +9,33 @@ export interface MistralClientConfig {
 
   /** Optional request timeout (ms). */
   timeoutMs?: number
+
+  /** Optional default headers to include with every request. */
+  defaultHeaders?: Record<string, string>
 }
 
 /**
  * Creates a Mistral SDK client instance.
  */
 export function createMistralClient(config: MistralClientConfig): Mistral {
-  const { apiKey, serverURL, timeoutMs } = config
+  const { apiKey, serverURL, timeoutMs, defaultHeaders } = config
+
+  let httpClient: HTTPClient | undefined
+  if (defaultHeaders && Object.keys(defaultHeaders).length > 0) {
+    httpClient = new HTTPClient()
+    httpClient.addHook('beforeRequest', (req) => {
+      for (const [key, value] of Object.entries(defaultHeaders)) {
+        req.headers.set(key, value)
+      }
+      return req
+    })
+  }
+
   return new Mistral({
     apiKey,
-    ...(serverURL ? { serverURL } : {}),
-    ...(timeoutMs ? { timeoutMs } : {}),
+    ...(serverURL !== undefined ? { serverURL } : {}),
+    ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+    ...(httpClient !== undefined ? { httpClient } : {}),
   })
 }
 
@@ -28,26 +44,35 @@ export function createMistralClient(config: MistralClientConfig): Mistral {
  * @throws Error if MISTRAL_API_KEY is not found
  */
 export function getMistralApiKeyFromEnv(): string {
-  const env =
-    typeof globalThis !== 'undefined' && (globalThis as any).window?.env
-      ? (globalThis as any).window.env
-      : typeof process !== 'undefined'
-        ? process.env
-        : undefined
-  const key = env?.MISTRAL_API_KEY
+  let key: string | undefined
+
+  if (typeof process !== 'undefined' && typeof process.env !== 'undefined') {
+    key = process.env.MISTRAL_API_KEY
+  } else {
+    const g = globalThis as { window?: { env?: Record<string, string> } }
+    key = g.window?.env?.MISTRAL_API_KEY
+  }
 
   if (!key) {
     throw new Error(
-      'MISTRAL_API_KEY is required. Please set it in your environment variables or use the factory function with an explicit API key.',
+      'MISTRAL_API_KEY is required. In Node.js set it as an environment variable; in browser environments inject it via window.env.MISTRAL_API_KEY or use the factory function with an explicit API key.',
     )
   }
 
   return key
 }
 
+function uuidv4Fallback(): string {
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0
+    return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16)
+  })
+}
+
 /**
  * Generates a unique ID with a prefix.
  */
 export function generateId(prefix: string): string {
-  return `${prefix}-${Date.now()}-${Math.random().toString(36).substring(7)}`
+  const uuid = globalThis.crypto?.randomUUID?.() ?? uuidv4Fallback()
+  return `${prefix}-${uuid}`
 }

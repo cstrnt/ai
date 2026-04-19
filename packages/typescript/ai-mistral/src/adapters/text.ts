@@ -33,10 +33,121 @@ import type {
 } from '../message-types'
 import type { MistralClientConfig } from '../utils'
 
+function messagesToSnakeCase(
+  messages: Array<ChatCompletionMessageParam>,
+): Array<unknown> {
+  return messages.map((msg) => {
+    if (msg.role === 'tool') {
+      return {
+        role: 'tool',
+        tool_call_id: msg.toolCallId,
+        content: msg.content,
+        ...(msg.name !== undefined ? { name: msg.name } : {}),
+      }
+    }
+    if (msg.role === 'assistant') {
+      const base: Record<string, unknown> = {
+        role: 'assistant',
+        content: msg.content ?? null,
+      }
+      if (msg.toolCalls && msg.toolCalls.length > 0) {
+        base.tool_calls = msg.toolCalls.map((tc) => ({
+          id: tc.id,
+          type: tc.type ?? 'function',
+          function: tc.function,
+        }))
+      }
+      if (msg.prefix !== undefined) base.prefix = msg.prefix
+      return base
+    }
+    if (msg.role === 'user' && Array.isArray(msg.content)) {
+      return {
+        role: 'user',
+        content: msg.content.map((part) => {
+          if (part.type === 'image_url') {
+            return { type: 'image_url', image_url: part.imageUrl }
+          }
+          if (part.type === 'document_url') {
+            return { type: 'document_url', document_url: part.documentUrl }
+          }
+          return part
+        }),
+      }
+    }
+    return msg
+  })
+}
+
+function rawChunkToCamelCase(raw: Record<string, unknown>): MistralStreamChunk {
+  const rawChoices = (raw.choices as Array<Record<string, unknown>>) ?? []
+  return {
+    id: raw.id as string | undefined,
+    model: raw.model as string | undefined,
+    choices: rawChoices.map((choice) => {
+      const delta = (choice.delta as Record<string, unknown>) ?? {}
+      const rawToolCalls = delta.tool_calls as
+        | Array<Record<string, unknown>>
+        | undefined
+      return {
+        index: choice.index as number | undefined,
+        delta: {
+          role: delta.role as string | null | undefined,
+          content: delta.content as
+            | string
+            | Array<{ type: string; text?: string }>
+            | null
+            | undefined,
+          toolCalls: rawToolCalls?.map((tc) => ({
+            id: tc.id as string | undefined,
+            type: tc.type as string | undefined,
+            index: tc.index as number | undefined,
+            function: tc.function as {
+              name?: string
+              arguments?: string | Record<string, unknown>
+            },
+          })),
+        },
+        finishReason: (choice.finish_reason as string | null | undefined) ?? null,
+      }
+    }),
+    usage: raw.usage
+      ? (() => {
+          const u = raw.usage as Record<string, unknown>
+          return {
+            promptTokens: (u.prompt_tokens as number | undefined) ?? 0,
+            completionTokens: (u.completion_tokens as number | undefined) ?? 0,
+            totalTokens: (u.total_tokens as number | undefined) ?? 0,
+          }
+        })()
+      : undefined,
+  }
+}
+
+interface RawStreamParams {
+  model: string
+  messages: Array<ChatCompletionMessageParam>
+  temperature?: number | null
+  maxTokens?: number | null
+  topP?: number | null
+  tools?: unknown
+  stop?: unknown
+  randomSeed?: number | null
+  responseFormat?: unknown
+  toolChoice?: unknown
+  parallelToolCalls?: boolean | null
+  frequencyPenalty?: number | null
+  presencePenalty?: number | null
+  n?: number | null
+  prediction?: unknown
+  safePrompt?: boolean | null
+  stream?: true
+  [key: string]: unknown
+}
+
 /**
  * Configuration for Mistral text adapter.
  */
-export interface MistralTextConfig extends MistralClientConfig {}
+export type MistralTextConfig = MistralClientConfig
 
 /**
  * Alias for TextProviderOptions for external use.
@@ -90,14 +201,19 @@ export class MistralTextAdapter<
   ResolveInputModalities<TModel>,
   MistralMessageMetadataByModality
 > {
-  readonly kind = 'text' as const
   readonly name = 'mistral' as const
 
   private client: Mistral
+  private rawConfig: MistralClientConfig
 
   constructor(config: MistralTextConfig, model: TModel) {
-    super({}, model)
+    super(config, model)
+    // Retained for structuredOutput (see structuredOutput method); not used on
+    // streaming paths, which go through fetchRawMistralStream instead. E2E tests
+    // route Mistral through llmock via providers.ts (serverURL: base), so the
+    // custom SSE path remains covered.
     this.client = createMistralClient(config)
+    this.rawConfig = config
   }
 
   async *chatStream(
@@ -111,13 +227,11 @@ export class MistralTextAdapter<
       messageId: generateId(this.name),
       timestamp,
       hasEmittedRunStarted: false,
+      hasEmittedRunError: false,
     }
 
     try {
-      const stream = (await this.client.chat.stream(
-        requestParams as any,
-      )) as unknown as AsyncIterable<MistralStreamEvent>
-
+      const stream = this.fetchRawMistralStream(requestParams, this.rawConfig)
       yield* this.processMistralStreamChunks(stream, options, aguiState)
     } catch (error: unknown) {
       const err = error as Error & { code?: string }
@@ -132,21 +246,20 @@ export class MistralTextAdapter<
         }
       }
 
-      yield {
-        type: 'RUN_ERROR',
-        runId: aguiState.runId,
-        model: options.model,
-        timestamp,
-        error: {
-          message: err.message || 'Unknown error',
-          code: err.code,
-        },
+      if (!aguiState.hasEmittedRunError) {
+        yield {
+          type: 'RUN_ERROR',
+          runId: aguiState.runId,
+          model: options.model,
+          timestamp,
+          error: {
+            message: err.message || 'Unknown error',
+            code: err.code,
+          },
+        }
       }
 
-      console.error('>>> chatStream: Fatal error during response creation <<<')
-      console.error('>>> Error message:', err.message)
-      console.error('>>> Error stack:', err.stack)
-      console.error('>>> Full error:', err)
+      throw err
     }
   }
 
@@ -164,46 +277,39 @@ export class MistralTextAdapter<
       outputSchema.required || [],
     )
 
-    try {
-      const { stream: _stream, ...nonStreamParams } = requestParams
-      const response = (await this.client.chat.complete({
-        ...nonStreamParams,
-        responseFormat: {
-          type: 'json_schema',
-          jsonSchema: {
-            name: 'structured_output',
-            schemaDefinition: jsonSchema,
-            strict: true,
-          },
+    const { stream: _stream, ...nonStreamParams } = requestParams
+    const response = (await this.client.chat.complete({
+      ...nonStreamParams,
+      responseFormat: {
+        type: 'json_schema',
+        jsonSchema: {
+          name: 'structured_output',
+          schemaDefinition: jsonSchema,
+          strict: true,
         },
-      } as any)) as {
-        choices?: Array<{ message?: { content?: string | null } }>
-      }
+      },
+    } as Parameters<typeof this.client.chat.complete>[0])) as {
+      choices?: Array<{ message?: { content?: string | null } }>
+    }
 
-      const rawText = response.choices?.[0]?.message?.content || ''
-      const textContent =
-        typeof rawText === 'string' ? rawText : String(rawText)
+    const rawText = response.choices?.[0]?.message?.content || ''
+    const textContent =
+      typeof rawText === 'string' ? rawText : String(rawText)
 
-      let parsed: unknown
-      try {
-        parsed = JSON.parse(textContent)
-      } catch {
-        throw new Error(
-          `Failed to parse structured output as JSON. Content: ${textContent.slice(0, 200)}${textContent.length > 200 ? '...' : ''}`,
-        )
-      }
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(textContent)
+    } catch {
+      throw new Error(
+        `Failed to parse structured output as JSON. Content: ${textContent.slice(0, 200)}${textContent.length > 200 ? '...' : ''}`,
+      )
+    }
 
-      const transformed = transformNullsToUndefined(parsed)
+    const transformed = transformNullsToUndefined(parsed)
 
-      return {
-        data: transformed,
-        rawText: textContent,
-      }
-    } catch (error: unknown) {
-      const err = error as Error
-      console.error('>>> structuredOutput: Error during response creation <<<')
-      console.error('>>> Error message:', err.message)
-      throw error
+    return {
+      data: transformed,
+      rawText: textContent,
     }
   }
 
@@ -218,11 +324,13 @@ export class MistralTextAdapter<
       messageId: string
       timestamp: number
       hasEmittedRunStarted: boolean
+      hasEmittedRunError: boolean
     },
   ): AsyncIterable<StreamChunk> {
     let accumulatedContent = ''
     const timestamp = aguiState.timestamp
     let hasEmittedTextMessageStart = false
+    let hasEmittedToolCall = false
 
     const toolCallsInProgress = new Map<
       number,
@@ -231,6 +339,7 @@ export class MistralTextAdapter<
         name: string
         arguments: string
         started: boolean
+        ended: boolean
       }
     >()
 
@@ -290,6 +399,7 @@ export class MistralTextAdapter<
                 name: toolCallDelta.function.name || '',
                 arguments: '',
                 started: false,
+                ended: false,
               })
             }
 
@@ -301,11 +411,14 @@ export class MistralTextAdapter<
             if (toolCallDelta.function.name) {
               toolCall.name = toolCallDelta.function.name
             }
-            if (toolCallDelta.function.arguments !== undefined) {
-              const argsDelta =
-                typeof toolCallDelta.function.arguments === 'string'
+            const argsDelta =
+              toolCallDelta.function.arguments !== undefined
+                ? typeof toolCallDelta.function.arguments === 'string'
                   ? toolCallDelta.function.arguments
                   : JSON.stringify(toolCallDelta.function.arguments)
+                : undefined
+
+            if (argsDelta !== undefined) {
               toolCall.arguments += argsDelta
             }
 
@@ -321,11 +434,7 @@ export class MistralTextAdapter<
               }
             }
 
-            if (toolCallDelta.function.arguments !== undefined && toolCall.started) {
-              const argsDelta =
-                typeof toolCallDelta.function.arguments === 'string'
-                  ? toolCallDelta.function.arguments
-                  : JSON.stringify(toolCallDelta.function.arguments)
+            if (argsDelta !== undefined && toolCall.started) {
               yield {
                 type: 'TOOL_CALL_ARGS',
                 toolCallId: toolCall.id,
@@ -343,7 +452,7 @@ export class MistralTextAdapter<
             toolCallsInProgress.size > 0
           ) {
             for (const [, toolCall] of toolCallsInProgress) {
-              if (!toolCall.started || !toolCall.id || !toolCall.name) {
+              if (!toolCall.started || !toolCall.id || !toolCall.name || toolCall.ended) {
                 continue
               }
 
@@ -356,6 +465,8 @@ export class MistralTextAdapter<
                 parsedInput = {}
               }
 
+              toolCall.ended = true
+              hasEmittedToolCall = true
               yield {
                 type: 'TOOL_CALL_END',
                 toolCallId: toolCall.id,
@@ -368,8 +479,7 @@ export class MistralTextAdapter<
           }
 
           const computedFinishReason =
-            choice.finishReason === 'tool_calls' ||
-            toolCallsInProgress.size > 0
+            choice.finishReason === 'tool_calls' || hasEmittedToolCall
               ? 'tool_calls'
               : choice.finishReason === 'length'
                 ? 'length'
@@ -404,8 +514,8 @@ export class MistralTextAdapter<
       }
     } catch (error: unknown) {
       const err = error as Error & { code?: string }
-      console.log('[Mistral Adapter] Stream ended with error:', err.message)
 
+      aguiState.hasEmittedRunError = true
       yield {
         type: 'RUN_ERROR',
         runId: aguiState.runId,
@@ -416,6 +526,107 @@ export class MistralTextAdapter<
           code: err.code,
         },
       }
+      throw err
+    }
+  }
+
+  /**
+   * Makes a raw fetch request to the Mistral chat completions endpoint and
+   * parses the SSE stream manually, bypassing the SDK's Zod validation which
+   * rejects streaming tool call chunks that omit `name` in argument deltas.
+   */
+  private async *fetchRawMistralStream(
+    params: RawStreamParams,
+    config: MistralClientConfig,
+  ): AsyncGenerator<MistralStreamEvent> {
+    const serverURL = (config.serverURL ?? 'https://api.mistral.ai')
+      .replace(/\/+$/, '')
+      .replace(/\/v1$/, '')
+    const url = `${serverURL}/v1/chat/completions`
+
+    const {
+      stream: _stream,
+      messages,
+      maxTokens,
+      topP,
+      randomSeed,
+      responseFormat,
+      toolChoice,
+      parallelToolCalls,
+      frequencyPenalty,
+      presencePenalty,
+      safePrompt,
+      ...rest
+    } = params
+
+    const body: Record<string, unknown> = {
+      ...rest,
+      messages: messagesToSnakeCase(messages),
+      stream: true,
+      ...(maxTokens != null && { max_tokens: maxTokens }),
+      ...(topP != null && { top_p: topP }),
+      ...(randomSeed != null && { random_seed: randomSeed }),
+      ...(responseFormat != null && { response_format: responseFormat }),
+      ...(toolChoice != null && { tool_choice: toolChoice }),
+      ...(parallelToolCalls != null && {
+        parallel_tool_calls: parallelToolCalls,
+      }),
+      ...(frequencyPenalty != null && {
+        frequency_penalty: frequencyPenalty,
+      }),
+      ...(presencePenalty != null && {
+        presence_penalty: presencePenalty,
+      }),
+      ...(safePrompt != null && { safe_prompt: safePrompt }),
+    }
+
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${config.apiKey}`,
+      ...config.defaultHeaders,
+    }
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+    })
+
+    if (!response.ok || !response.body) {
+      const errorText = await response.text()
+      throw new Error(`Mistral API error ${response.status}: ${errorText}`)
+    }
+
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop()!
+
+        for (const line of lines) {
+          const trimmed = line.trim()
+          if (!trimmed.startsWith('data:')) continue
+          const data = trimmed.slice(5).trimStart()
+          if (data === '[DONE]') return
+
+          try {
+            const raw = JSON.parse(data) as Record<string, unknown>
+            yield { data: rawChunkToCamelCase(raw) }
+          } catch {
+            // skip malformed chunks
+          }
+        }
+      }
+    } finally {
+      await reader.cancel().catch(() => {})
+      reader.releaseLock()
     }
   }
 
@@ -437,15 +648,7 @@ export class MistralTextAdapter<
   /**
    * Maps common TextOptions to Mistral Chat Completions request parameters.
    */
-  private mapTextOptionsToMistral(options: TextOptions): {
-    model: string
-    messages: Array<ChatCompletionMessageParam>
-    temperature?: number | null
-    maxTokens?: number | null
-    topP?: number | null
-    tools?: Array<unknown>
-    stream: true
-  } {
+  private mapTextOptionsToMistral(options: TextOptions) {
     const modelOptions = options.modelOptions as
       | Omit<
           InternalTextProviderOptions,
@@ -484,7 +687,19 @@ export class MistralTextAdapter<
       maxTokens: options.maxTokens,
       topP: options.topP,
       tools,
-      stream: true,
+      stream: true as const,
+      ...(modelOptions && {
+        ...(modelOptions.stop !== undefined && { stop: modelOptions.stop }),
+        ...(modelOptions.random_seed !== undefined && { randomSeed: modelOptions.random_seed }),
+        ...(modelOptions.response_format !== undefined && { responseFormat: modelOptions.response_format }),
+        ...(modelOptions.tool_choice !== undefined && { toolChoice: modelOptions.tool_choice }),
+        ...(modelOptions.parallel_tool_calls !== undefined && { parallelToolCalls: modelOptions.parallel_tool_calls }),
+        ...(modelOptions.frequency_penalty !== undefined && { frequencyPenalty: modelOptions.frequency_penalty }),
+        ...(modelOptions.presence_penalty !== undefined && { presencePenalty: modelOptions.presence_penalty }),
+        ...(modelOptions.n !== undefined && { n: modelOptions.n }),
+        ...(modelOptions.prediction !== undefined && { prediction: modelOptions.prediction }),
+        ...(modelOptions.safe_prompt !== undefined && { safePrompt: modelOptions.safe_prompt }),
+      }),
     }
   }
 
@@ -495,9 +710,12 @@ export class MistralTextAdapter<
     message: ModelMessage,
   ): ChatCompletionMessageParam {
     if (message.role === 'tool') {
+      if (!message.toolCallId) {
+        throw new Error('Missing toolCallId for tool message')
+      }
       return {
         role: 'tool',
-        toolCallId: message.toolCallId || '',
+        toolCallId: message.toolCallId,
         content:
           typeof message.content === 'string'
             ? message.content

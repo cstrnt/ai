@@ -1,5 +1,11 @@
 import type { MistralTextProviderOptions } from './text/text-provider-options'
 
+/** Provider options for vision-capable Mistral models (pixtral-*). */
+export type MistralVisionProviderOptions = MistralTextProviderOptions
+
+/** Provider options for reasoning-capable Mistral models (magistral-*). */
+export type MistralReasoningProviderOptions = MistralTextProviderOptions
+
 /**
  * Internal metadata structure describing a Mistral model's capabilities
  * and approximate pricing (USD per million tokens).
@@ -32,11 +38,11 @@ interface ModelMeta<TProviderOptions = unknown> {
 
 const MISTRAL_LARGE_LATEST = {
   name: 'mistral-large-latest',
-  context_window: 131_072,
+  context_window: 256_000,
   max_completion_tokens: 8_192,
   pricing: {
-    input: { normal: 2 },
-    output: { normal: 6 },
+    input: { normal: 0.5 },
+    output: { normal: 1.5 },
   },
   supports: {
     input: ['text'],
@@ -249,7 +255,17 @@ export type MistralModelInputModalitiesByName = {
  * Type-only map from Mistral chat model name to its provider options type.
  */
 export type MistralChatModelProviderOptionsByName = {
-  [K in (typeof MISTRAL_CHAT_MODELS)[number]]: MistralTextProviderOptions
+  [MISTRAL_LARGE_LATEST.name]: MistralTextProviderOptions
+  [MISTRAL_MEDIUM_LATEST.name]: MistralVisionProviderOptions
+  [MISTRAL_SMALL_LATEST.name]: MistralVisionProviderOptions
+  [MINISTRAL_8B_LATEST.name]: MistralTextProviderOptions
+  [MINISTRAL_3B_LATEST.name]: MistralTextProviderOptions
+  [CODESTRAL_LATEST.name]: MistralTextProviderOptions
+  [PIXTRAL_LARGE_LATEST.name]: MistralVisionProviderOptions
+  [PIXTRAL_12B_2409.name]: MistralVisionProviderOptions
+  [MAGISTRAL_MEDIUM_LATEST.name]: MistralReasoningProviderOptions
+  [MAGISTRAL_SMALL_LATEST.name]: MistralReasoningProviderOptions
+  [OPEN_MISTRAL_NEMO.name]: MistralTextProviderOptions
 }
 
 /**
