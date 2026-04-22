@@ -25,6 +25,7 @@ or plain JSON Schema objects for runtime validation and type safety.
 
 - [`ToolDefinitionInstance`](ToolDefinitionInstance.md)
 - [`ServerTool`](ServerTool.md)
+- [`ProviderTool`](ProviderTool.md)
 
 ## Type Parameters
 
