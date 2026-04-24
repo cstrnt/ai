@@ -9,6 +9,12 @@ import {
   transformNullsToUndefined,
 } from '../utils'
 import type {
+  ContentPart,
+  ModelMessage,
+  StreamChunk,
+  TextOptions,
+} from '@tanstack/ai'
+import type {
   MISTRAL_CHAT_MODELS,
   ResolveInputModalities,
   ResolveProviderOptions,
@@ -18,12 +24,6 @@ import type {
   StructuredOutputResult,
 } from '@tanstack/ai/adapters'
 import type { Mistral } from '@mistralai/mistralai'
-import type {
-  ContentPart,
-  ModelMessage,
-  StreamChunk,
-  TextOptions,
-} from '@tanstack/ai'
 import type { InternalTextProviderOptions } from '../text/text-provider-options'
 import type {
   ChatCompletionContentPart,
@@ -189,6 +189,11 @@ interface MistralStreamEvent {
   data: MistralStreamChunk
 }
 
+/** Cast an event object to StreamChunk. Adapters construct events with string
+ *  literal types which are structurally compatible with the EventType enum. */
+const asChunk = (chunk: Record<string, unknown>) =>
+  chunk as unknown as StreamChunk
+
 /**
  * Mistral Text (Chat) Adapter.
  *
@@ -224,11 +229,11 @@ export class MistralTextAdapter<
     const timestamp = Date.now()
 
     const aguiState = {
-      runId: generateId(this.name),
+      runId: options.runId ?? generateId(this.name),
+      threadId: options.threadId ?? generateId(this.name),
       messageId: generateId(this.name),
       timestamp,
       hasEmittedRunStarted: false,
-      hasEmittedRunError: false,
     }
 
     try {
@@ -239,26 +244,27 @@ export class MistralTextAdapter<
 
       if (!aguiState.hasEmittedRunStarted) {
         aguiState.hasEmittedRunStarted = true
-        yield {
+        yield asChunk({
           type: 'RUN_STARTED',
           runId: aguiState.runId,
+          threadId: aguiState.threadId,
           model: options.model,
           timestamp,
-        }
+        })
       }
 
-      if (!aguiState.hasEmittedRunError) {
-        yield {
-          type: 'RUN_ERROR',
-          runId: aguiState.runId,
-          model: options.model,
-          timestamp,
-          error: {
-            message: err.message || 'Unknown error',
-            code: err.code,
-          },
-        }
-      }
+      yield asChunk({
+        type: 'RUN_ERROR',
+        runId: aguiState.runId,
+        model: options.model,
+        timestamp,
+        message: err.message || 'Unknown error',
+        code: err.code,
+        error: {
+          message: err.message || 'Unknown error',
+          code: err.code,
+        },
+      })
 
       throw err
     }
@@ -321,10 +327,10 @@ export class MistralTextAdapter<
     options: TextOptions,
     aguiState: {
       runId: string
+      threadId: string
       messageId: string
       timestamp: number
       hasEmittedRunStarted: boolean
-      hasEmittedRunError: boolean
     },
   ): AsyncIterable<StreamChunk> {
     let accumulatedContent = ''
@@ -352,12 +358,13 @@ export class MistralTextAdapter<
 
         if (!aguiState.hasEmittedRunStarted) {
           aguiState.hasEmittedRunStarted = true
-          yield {
+          yield asChunk({
             type: 'RUN_STARTED',
             runId: aguiState.runId,
+            threadId: aguiState.threadId,
             model: chunk.model || options.model,
             timestamp,
-          }
+          })
         }
 
         const delta = choice.delta
@@ -367,25 +374,25 @@ export class MistralTextAdapter<
         if (deltaContent) {
           if (!hasEmittedTextMessageStart) {
             hasEmittedTextMessageStart = true
-            yield {
+            yield asChunk({
               type: 'TEXT_MESSAGE_START',
               messageId: aguiState.messageId,
               model: chunk.model || options.model,
               timestamp,
               role: 'assistant',
-            }
+            })
           }
 
           accumulatedContent += deltaContent
 
-          yield {
+          yield asChunk({
             type: 'TEXT_MESSAGE_CONTENT',
             messageId: aguiState.messageId,
             model: chunk.model || options.model,
             timestamp,
             delta: deltaContent,
             content: accumulatedContent,
-          }
+          })
         }
 
         if (deltaToolCalls) {
@@ -424,24 +431,25 @@ export class MistralTextAdapter<
 
             if (toolCall.id && toolCall.name && !toolCall.started) {
               toolCall.started = true
-              yield {
+              yield asChunk({
                 type: 'TOOL_CALL_START',
                 toolCallId: toolCall.id,
+                toolCallName: toolCall.name,
                 toolName: toolCall.name,
                 model: chunk.model || options.model,
                 timestamp,
                 index,
-              }
+              })
             }
 
             if (argsDelta !== undefined && toolCall.started) {
-              yield {
+              yield asChunk({
                 type: 'TOOL_CALL_ARGS',
                 toolCallId: toolCall.id,
                 model: chunk.model || options.model,
                 timestamp,
                 delta: argsDelta,
-              }
+              })
             }
           }
         }
@@ -472,14 +480,15 @@ export class MistralTextAdapter<
 
               toolCall.ended = true
               hasEmittedToolCall = true
-              yield {
+              yield asChunk({
                 type: 'TOOL_CALL_END',
                 toolCallId: toolCall.id,
+                toolCallName: toolCall.name,
                 toolName: toolCall.name,
                 model: chunk.model || options.model,
                 timestamp,
                 input: parsedInput,
-              }
+              })
             }
           }
 
@@ -491,19 +500,20 @@ export class MistralTextAdapter<
                 : 'stop'
 
           if (hasEmittedTextMessageStart) {
-            yield {
+            yield asChunk({
               type: 'TEXT_MESSAGE_END',
               messageId: aguiState.messageId,
               model: chunk.model || options.model,
               timestamp,
-            }
+            })
           }
 
           const usage = chunk.usage
 
-          yield {
+          yield asChunk({
             type: 'RUN_FINISHED',
             runId: aguiState.runId,
+            threadId: aguiState.threadId,
             model: chunk.model || options.model,
             timestamp,
             usage: usage
@@ -514,23 +524,24 @@ export class MistralTextAdapter<
                 }
               : undefined,
             finishReason: computedFinishReason,
-          }
+          })
         }
       }
     } catch (error: unknown) {
       const err = error as Error & { code?: string }
 
-      aguiState.hasEmittedRunError = true
-      yield {
+      yield asChunk({
         type: 'RUN_ERROR',
         runId: aguiState.runId,
         model: options.model,
         timestamp,
+        message: err.message || 'Unknown error occurred',
+        code: err.code,
         error: {
           message: err.message || 'Unknown error occurred',
           code: err.code,
         },
-      }
+      })
       throw err
     }
   }
