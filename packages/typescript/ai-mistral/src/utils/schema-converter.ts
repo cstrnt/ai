@@ -16,7 +16,10 @@ export function transformNullsToUndefined<T>(obj: T): T {
       .filter((item) => item !== undefined) as unknown as T
   }
 
-  if (typeof obj === 'object' && Object.getPrototypeOf(obj) === Object.prototype) {
+  if (
+    typeof obj === 'object' &&
+    Object.getPrototypeOf(obj) === Object.prototype
+  ) {
     const result: Record<string, unknown> = {}
     for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
       const transformed = transformNullsToUndefined(value)

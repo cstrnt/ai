@@ -90,8 +90,7 @@ export interface MistralTextProviderOptions {
 /**
  * Internal options interface used for validation within the adapter.
  */
-export interface InternalTextProviderOptions
-  extends MistralTextProviderOptions {
+export interface InternalTextProviderOptions extends MistralTextProviderOptions {
   messages: Array<ChatCompletionMessageParam>
   model: string
   stream?: boolean | null

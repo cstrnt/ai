@@ -107,7 +107,8 @@ function rawChunkToCamelCase(raw: Record<string, unknown>): MistralStreamChunk {
             },
           })),
         },
-        finishReason: (choice.finish_reason as string | null | undefined) ?? null,
+        finishReason:
+          (choice.finish_reason as string | null | undefined) ?? null,
       }
     }),
     usage: raw.usage
@@ -293,8 +294,7 @@ export class MistralTextAdapter<
     }
 
     const rawText = response.choices?.[0]?.message?.content || ''
-    const textContent =
-      typeof rawText === 'string' ? rawText : String(rawText)
+    const textContent = typeof rawText === 'string' ? rawText : String(rawText)
 
     let parsed: unknown
     try {
@@ -452,7 +452,12 @@ export class MistralTextAdapter<
             toolCallsInProgress.size > 0
           ) {
             for (const [, toolCall] of toolCallsInProgress) {
-              if (!toolCall.started || !toolCall.id || !toolCall.name || toolCall.ended) {
+              if (
+                !toolCall.started ||
+                !toolCall.id ||
+                !toolCall.name ||
+                toolCall.ended
+              ) {
                 continue
               }
 
@@ -690,15 +695,31 @@ export class MistralTextAdapter<
       stream: true as const,
       ...(modelOptions && {
         ...(modelOptions.stop !== undefined && { stop: modelOptions.stop }),
-        ...(modelOptions.random_seed !== undefined && { randomSeed: modelOptions.random_seed }),
-        ...(modelOptions.response_format !== undefined && { responseFormat: modelOptions.response_format }),
-        ...(modelOptions.tool_choice !== undefined && { toolChoice: modelOptions.tool_choice }),
-        ...(modelOptions.parallel_tool_calls !== undefined && { parallelToolCalls: modelOptions.parallel_tool_calls }),
-        ...(modelOptions.frequency_penalty !== undefined && { frequencyPenalty: modelOptions.frequency_penalty }),
-        ...(modelOptions.presence_penalty !== undefined && { presencePenalty: modelOptions.presence_penalty }),
+        ...(modelOptions.random_seed !== undefined && {
+          randomSeed: modelOptions.random_seed,
+        }),
+        ...(modelOptions.response_format !== undefined && {
+          responseFormat: modelOptions.response_format,
+        }),
+        ...(modelOptions.tool_choice !== undefined && {
+          toolChoice: modelOptions.tool_choice,
+        }),
+        ...(modelOptions.parallel_tool_calls !== undefined && {
+          parallelToolCalls: modelOptions.parallel_tool_calls,
+        }),
+        ...(modelOptions.frequency_penalty !== undefined && {
+          frequencyPenalty: modelOptions.frequency_penalty,
+        }),
+        ...(modelOptions.presence_penalty !== undefined && {
+          presencePenalty: modelOptions.presence_penalty,
+        }),
         ...(modelOptions.n !== undefined && { n: modelOptions.n }),
-        ...(modelOptions.prediction !== undefined && { prediction: modelOptions.prediction }),
-        ...(modelOptions.safe_prompt !== undefined && { safePrompt: modelOptions.safe_prompt }),
+        ...(modelOptions.prediction !== undefined && {
+          prediction: modelOptions.prediction,
+        }),
+        ...(modelOptions.safe_prompt !== undefined && {
+          safePrompt: modelOptions.safe_prompt,
+        }),
       }),
     }
   }
