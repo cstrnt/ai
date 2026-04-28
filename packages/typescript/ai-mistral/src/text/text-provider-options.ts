@@ -101,13 +101,3 @@ export interface InternalTextProviderOptions extends MistralTextProviderOptions 
  * External provider options (what users pass in).
  */
 export type ExternalTextProviderOptions = MistralTextProviderOptions
-
-/**
- * Validates text provider options.
- * Basic validation stub — Mistral API handles detailed validation.
- */
-export function validateTextProviderOptions(
-  _options: InternalTextProviderOptions,
-): void {
-  // Mistral API handles detailed validation
-}

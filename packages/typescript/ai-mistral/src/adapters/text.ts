@@ -1,5 +1,4 @@
 import { BaseTextAdapter } from '@tanstack/ai/adapters'
-import { validateTextProviderOptions } from '../text/text-provider-options'
 import { convertToolsToProviderFormat } from '../tools'
 import {
   createMistralClient,
@@ -44,9 +43,32 @@ const asChunk = (chunk: Record<string, unknown>) =>
   chunk as unknown as StreamChunk
 
 /**
+ * Parse the accumulated streaming arguments for a tool call. Throws a clear
+ * error if the JSON is malformed — silently substituting `{}` would let a
+ * tool fire with empty inputs, masking truncated streams or mis-shaped output.
+ */
+function parseToolCallInput(toolCall: {
+  id: string
+  name: string
+  arguments: string
+}): unknown {
+  if (!toolCall.arguments) return {}
+  try {
+    return transformNullsToUndefined(JSON.parse(toolCall.arguments))
+  } catch (cause) {
+    const preview = toolCall.arguments.slice(0, 200)
+    const ellipsis = toolCall.arguments.length > 200 ? '...' : ''
+    throw new Error(
+      `Failed to parse tool call arguments for tool '${toolCall.name}' (id: ${toolCall.id}). Arguments: ${preview}${ellipsis}`,
+      { cause },
+    )
+  }
+}
+
+/**
  * Configuration for Mistral text adapter.
  */
-export interface MistralTextConfig extends MistralClientConfig {}
+export type MistralTextConfig = MistralClientConfig
 
 /**
  * Alias for TextProviderOptions for external use.
@@ -91,7 +113,24 @@ interface MistralRawChoice {
   index?: number
   delta?: {
     role?: string | null
-    content?: string | Array<{ type: string; text?: string }> | null
+    content?:
+      | string
+      | Array<{
+          type: string
+          text?: string
+          // Mistral magistral models stream reasoning as content parts of
+          // type 'thinking' whose `thinking` field is itself an array of
+          // text/reference chunks. See Mistral SDK ThinkChunk type.
+          thinking?: Array<{ type: string; text?: string }>
+        }>
+      | null
+    // Some OpenAI-compatible deployments (DeepSeek, Groq for reasoning
+    // models, and aimock-based test environments) emit reasoning via a
+    // separate `reasoning_content` delta field rather than as a content
+    // part. Accept both shapes — they cannot collide because real Mistral
+    // never sets the OpenAI-compat field, and aimock never sets the
+    // thinking content part.
+    reasoning_content?: string | null
     tool_calls?: Array<MistralRawToolCall>
   }
   finish_reason?: string | null
@@ -252,7 +291,17 @@ export class MistralTextAdapter<
     let accumulatedContent = ''
     const timestamp = aguiState.timestamp
     let hasEmittedTextMessageStart = false
+    let hasEmittedTextMessageEnd = false
     let hasEmittedToolCall = false
+    let hasEmittedRunFinished = false
+    let lastChunkModel = options.model
+
+    // Reasoning lifecycle (magistral-* models stream `thinking` content
+    // parts before any text). Mirrors the anthropic adapter's pattern:
+    // open REASONING_* events on the first thinking delta, close them when
+    // text/tool content begins or the run finishes.
+    let reasoningMessageId: string | null = null
+    let hasClosedReasoning = false
 
     const toolCallsInProgress = new Map<
       number,
@@ -267,6 +316,7 @@ export class MistralTextAdapter<
 
     try {
       for await (const chunk of stream) {
+        lastChunkModel = chunk.model || options.model
         const choice = chunk.choices?.[0]
         if (!choice) continue
 
@@ -284,8 +334,67 @@ export class MistralTextAdapter<
         }
 
         const delta = choice.delta
-        const deltaContent = this.extractDeltaText(delta?.content)
+        const { text: deltaContent, thinking: deltaThinkingFromContent } =
+          this.extractDeltaParts(delta?.content)
+        // Reasoning may also arrive as a separate top-level field
+        // (`delta.reasoning_content`) on OpenAI-compatible deployments.
+        const deltaThinking =
+          deltaThinkingFromContent +
+          (typeof delta?.reasoning_content === 'string'
+            ? delta.reasoning_content
+            : '')
         const deltaToolCalls = delta?.tool_calls
+
+        // Emit reasoning events FIRST so they always precede the matching
+        // text or tool deltas in the same chunk.
+        if (deltaThinking) {
+          if (reasoningMessageId === null) {
+            reasoningMessageId = generateId(this.name)
+            yield asChunk({
+              type: 'REASONING_START',
+              messageId: reasoningMessageId,
+              model: chunkModel,
+              timestamp,
+            })
+            yield asChunk({
+              type: 'REASONING_MESSAGE_START',
+              messageId: reasoningMessageId,
+              role: 'reasoning',
+              model: chunkModel,
+              timestamp,
+            })
+          }
+          yield asChunk({
+            type: 'REASONING_MESSAGE_CONTENT',
+            messageId: reasoningMessageId,
+            model: chunkModel,
+            timestamp,
+            delta: deltaThinking,
+          })
+        }
+
+        // Close reasoning before any text/tool output starts in this chunk.
+        const aboutToEmitOutput =
+          !!deltaContent || (!!deltaToolCalls && deltaToolCalls.length > 0)
+        if (
+          reasoningMessageId !== null &&
+          !hasClosedReasoning &&
+          aboutToEmitOutput
+        ) {
+          hasClosedReasoning = true
+          yield asChunk({
+            type: 'REASONING_MESSAGE_END',
+            messageId: reasoningMessageId,
+            model: chunkModel,
+            timestamp,
+          })
+          yield asChunk({
+            type: 'REASONING_END',
+            messageId: reasoningMessageId,
+            model: chunkModel,
+            timestamp,
+          })
+        }
 
         if (deltaContent) {
           if (!hasEmittedTextMessageStart) {
@@ -345,7 +454,9 @@ export class MistralTextAdapter<
               toolCall.arguments += argsDelta
             }
 
-            if (toolCall.id && toolCall.name && !toolCall.started) {
+            const justStarted =
+              !!toolCall.id && !!toolCall.name && !toolCall.started
+            if (justStarted) {
               toolCall.started = true
               yield asChunk({
                 type: 'TOOL_CALL_START',
@@ -356,9 +467,18 @@ export class MistralTextAdapter<
                 timestamp,
                 index,
               })
-            }
-
-            if (argsDelta !== undefined && toolCall.started) {
+              // Replay any args buffered before id+name arrived (including
+              // this chunk's argsDelta, if any).
+              if (toolCall.arguments.length > 0) {
+                yield asChunk({
+                  type: 'TOOL_CALL_ARGS',
+                  toolCallId: toolCall.id,
+                  model: chunkModel,
+                  timestamp,
+                  delta: toolCall.arguments,
+                })
+              }
+            } else if (argsDelta !== undefined && toolCall.started) {
               yield asChunk({
                 type: 'TOOL_CALL_ARGS',
                 toolCallId: toolCall.id,
@@ -383,14 +503,7 @@ export class MistralTextAdapter<
                 continue
               }
 
-              let parsedInput: unknown = {}
-              try {
-                parsedInput = toolCall.arguments
-                  ? JSON.parse(toolCall.arguments)
-                  : {}
-              } catch {
-                parsedInput = {}
-              }
+              const parsedInput = parseToolCallInput(toolCall)
 
               toolCall.ended = true
               hasEmittedToolCall = true
@@ -413,7 +526,27 @@ export class MistralTextAdapter<
                 ? 'length'
                 : 'stop'
 
-          if (hasEmittedTextMessageStart) {
+          // If the run finished while reasoning was still open (no text or
+          // tool output ever followed), close reasoning before TEXT/RUN
+          // finalization events.
+          if (reasoningMessageId !== null && !hasClosedReasoning) {
+            hasClosedReasoning = true
+            yield asChunk({
+              type: 'REASONING_MESSAGE_END',
+              messageId: reasoningMessageId,
+              model: chunkModel,
+              timestamp,
+            })
+            yield asChunk({
+              type: 'REASONING_END',
+              messageId: reasoningMessageId,
+              model: chunkModel,
+              timestamp,
+            })
+          }
+
+          if (hasEmittedTextMessageStart && !hasEmittedTextMessageEnd) {
+            hasEmittedTextMessageEnd = true
             yield asChunk({
               type: 'TEXT_MESSAGE_END',
               messageId: aguiState.messageId,
@@ -423,6 +556,7 @@ export class MistralTextAdapter<
           }
 
           const usage = chunk.usage
+          hasEmittedRunFinished = true
           yield asChunk({
             type: 'RUN_FINISHED',
             runId: aguiState.runId,
@@ -440,22 +574,115 @@ export class MistralTextAdapter<
           })
         }
       }
-    } catch (error: unknown) {
-      const err = error as Error & { code?: string }
 
-      yield asChunk({
-        type: 'RUN_ERROR',
-        runId: aguiState.runId,
-        model: options.model,
-        timestamp,
-        message: err.message || 'Unknown error occurred',
-        code: err.code,
-        error: {
-          message: err.message || 'Unknown error occurred',
-          code: err.code,
-        },
-      })
-      throw err
+      // Stream ended cleanly without finish_reason — flush any open
+      // lifecycle events so consumers don't see orphaned starts. This
+      // happens for abrupt `[DONE]` or upstream cuts.
+      if (!hasEmittedRunFinished) {
+        if (reasoningMessageId !== null && !hasClosedReasoning) {
+          hasClosedReasoning = true
+          yield asChunk({
+            type: 'REASONING_MESSAGE_END',
+            messageId: reasoningMessageId,
+            model: lastChunkModel,
+            timestamp,
+          })
+          yield asChunk({
+            type: 'REASONING_END',
+            messageId: reasoningMessageId,
+            model: lastChunkModel,
+            timestamp,
+          })
+        }
+        for (const [, toolCall] of toolCallsInProgress) {
+          if (toolCall.started && !toolCall.ended) {
+            toolCall.ended = true
+            hasEmittedToolCall = true
+            yield asChunk({
+              type: 'TOOL_CALL_END',
+              toolCallId: toolCall.id,
+              toolCallName: toolCall.name,
+              toolName: toolCall.name,
+              model: lastChunkModel,
+              timestamp,
+              input: parseToolCallInput(toolCall),
+            })
+          }
+        }
+        if (hasEmittedTextMessageStart && !hasEmittedTextMessageEnd) {
+          hasEmittedTextMessageEnd = true
+          yield asChunk({
+            type: 'TEXT_MESSAGE_END',
+            messageId: aguiState.messageId,
+            model: lastChunkModel,
+            timestamp,
+          })
+        }
+        hasEmittedRunFinished = true
+        yield asChunk({
+          type: 'RUN_FINISHED',
+          runId: aguiState.runId,
+          threadId: aguiState.threadId,
+          model: lastChunkModel,
+          timestamp,
+          usage: undefined,
+          finishReason: hasEmittedToolCall ? 'tool_calls' : 'stop',
+        })
+      }
+    } catch (error: unknown) {
+      // Lifecycle cleanup (TEXT_MESSAGE_END / TOOL_CALL_END / REASONING_END)
+      // on error path so consumers don't see orphaned starts. RUN_ERROR is
+      // emitted by the outer chatStream catch — emitting it here would
+      // duplicate the event.
+      if (reasoningMessageId !== null && !hasClosedReasoning) {
+        hasClosedReasoning = true
+        yield asChunk({
+          type: 'REASONING_MESSAGE_END',
+          messageId: reasoningMessageId,
+          model: lastChunkModel,
+          timestamp,
+        })
+        yield asChunk({
+          type: 'REASONING_END',
+          messageId: reasoningMessageId,
+          model: lastChunkModel,
+          timestamp,
+        })
+      }
+      if (hasEmittedTextMessageStart && !hasEmittedTextMessageEnd) {
+        hasEmittedTextMessageEnd = true
+        yield asChunk({
+          type: 'TEXT_MESSAGE_END',
+          messageId: aguiState.messageId,
+          model: lastChunkModel,
+          timestamp,
+        })
+      }
+      for (const [, toolCall] of toolCallsInProgress) {
+        if (toolCall.started && !toolCall.ended) {
+          toolCall.ended = true
+          // Best-effort parse for the partial args; if invalid, surface
+          // empty input rather than throwing inside the cleanup path.
+          let partialInput: unknown = {}
+          try {
+            partialInput = toolCall.arguments
+              ? transformNullsToUndefined(JSON.parse(toolCall.arguments))
+              : {}
+          } catch {
+            partialInput = {}
+          }
+          yield asChunk({
+            type: 'TOOL_CALL_END',
+            toolCallId: toolCall.id,
+            toolCallName: toolCall.name,
+            toolName: toolCall.name,
+            model: lastChunkModel,
+            timestamp,
+            input: partialInput,
+          })
+        }
+      }
+      throw error
     }
   }
 
@@ -492,7 +719,13 @@ export class MistralTextAdapter<
       throw new Error(`Mistral API error ${response.status}: ${errorText}`)
     }
 
-    const reader = response.body!.getReader()
+    if (!response.body) {
+      throw new Error(
+        'Mistral API returned a response with no body. This may indicate a proxy or runtime that does not support streaming.',
+      )
+    }
+
+    const reader = response.body.getReader()
     const decoder = new TextDecoder()
     let buffer = ''
 
@@ -511,11 +744,40 @@ export class MistralTextAdapter<
           const data = trimmed.slice(5).trimStart()
           if (data === '[DONE]') return
 
+          let parsed: unknown
           try {
-            yield JSON.parse(data) as MistralRawChunk
-          } catch {
-            // skip malformed chunks
+            parsed = JSON.parse(data)
+          } catch (e) {
+            if (e instanceof SyntaxError) {
+              console.warn(
+                `[mistral] skipped unparseable SSE chunk: ${data.slice(0, 200)}`,
+              )
+              continue
+            }
+            throw e
           }
+
+          // Mistral signals mid-stream errors via an `error` field. Surface
+          // them as RUN_ERROR rather than swallowing them as empty chunks.
+          if (
+            parsed &&
+            typeof parsed === 'object' &&
+            'error' in parsed &&
+            !('choices' in parsed)
+          ) {
+            const errPayload = (parsed as { error: unknown }).error
+            const message =
+              typeof errPayload === 'string'
+                ? errPayload
+                : errPayload &&
+                    typeof errPayload === 'object' &&
+                    'message' in errPayload
+                  ? String((errPayload as { message: unknown }).message)
+                  : JSON.stringify(errPayload)
+            throw new Error(`Mistral stream error: ${message}`)
+          }
+
+          yield parsed as MistralRawChunk
         }
       }
     } finally {
@@ -550,6 +812,8 @@ export class MistralTextAdapter<
       ...rest,
       messages: messages.map(messageToWire),
       stream: true,
+      // Opt in to usage on the final streaming chunk.
+      stream_options: { include_usage: true },
       ...(maxTokens != null && { max_tokens: maxTokens }),
       ...(topP != null && { top_p: topP }),
       ...(randomSeed != null && { random_seed: randomSeed }),
@@ -565,18 +829,41 @@ export class MistralTextAdapter<
   }
 
   /**
-   * Extracts text from a Mistral delta content, which can be a string or an
-   * array of content chunks.
+   * Splits a Mistral delta content payload into text and reasoning deltas.
+   * Mistral reasoning models (magistral-*) stream reasoning content as
+   * `{ type: 'thinking', thinking: [{ type: 'text', text }, ...] }` content
+   * parts. A single delta may contain text only, thinking only, or — rarely —
+   * both (when a step transitions); both fields are returned so the caller
+   * can sequence REASONING and TEXT lifecycle events in order.
    */
-  private extractDeltaText(
-    content: string | Array<{ type: string; text?: string }> | null | undefined,
-  ): string {
-    if (!content) return ''
-    if (typeof content === 'string') return content
-    return content
-      .filter((c) => c.type === 'text' && typeof c.text === 'string')
-      .map((c) => c.text!)
-      .join('')
+  private extractDeltaParts(
+    content:
+      | string
+      | Array<{
+          type: string
+          text?: string
+          thinking?: Array<{ type: string; text?: string }>
+        }>
+      | null
+      | undefined,
+  ): { text: string; thinking: string } {
+    if (!content) return { text: '', thinking: '' }
+    if (typeof content === 'string') return { text: content, thinking: '' }
+
+    let text = ''
+    let thinking = ''
+    for (const part of content) {
+      if (part.type === 'text' && typeof part.text === 'string') {
+        text += part.text
+      } else if (part.type === 'thinking' && Array.isArray(part.thinking)) {
+        for (const inner of part.thinking) {
+          if (inner.type === 'text' && typeof inner.text === 'string') {
+            thinking += inner.text
+          }
+        }
+      }
+    }
+    return { text, thinking }
   }
 
   /**
@@ -586,18 +873,8 @@ export class MistralTextAdapter<
     options: TextOptions<TProviderOptions>,
   ): ChatCompletionStreamRequest {
     const modelOptions = options.modelOptions as
-      | Omit<
-          InternalTextProviderOptions,
-          'max_tokens' | 'tools' | 'temperature' | 'top_p'
-        >
+      | Omit<InternalTextProviderOptions, 'max_tokens' | 'tools'>
       | undefined
-
-    if (modelOptions) {
-      validateTextProviderOptions({
-        ...modelOptions,
-        model: options.model,
-      } as InternalTextProviderOptions)
-    }
 
     const tools = options.tools
       ? convertToolsToProviderFormat(options.tools)
@@ -619,9 +896,9 @@ export class MistralTextAdapter<
     return {
       model: options.model,
       messages: messages as ChatCompletionStreamRequest['messages'],
-      temperature: options.temperature,
+      temperature: options.temperature ?? modelOptions?.temperature ?? undefined,
       maxTokens: options.maxTokens,
-      topP: options.topP ?? undefined,
+      topP: options.topP ?? modelOptions?.top_p ?? undefined,
       tools: tools as ChatCompletionStreamRequest['tools'],
       stream: true,
       ...(modelOptions && {
@@ -706,11 +983,9 @@ export class MistralTextAdapter<
       }
     }
 
-    const parts: Array<ChatCompletionContentPart> = []
-    for (const part of contentParts) {
-      const converted = this.convertContentPartToMistral(part)
-      if (converted) parts.push(converted)
-    }
+    const parts = contentParts.map((part) =>
+      this.convertContentPartToMistral(part),
+    )
 
     return {
       role: 'user',
@@ -724,7 +999,7 @@ export class MistralTextAdapter<
    */
   private convertContentPartToMistral(
     part: ContentPart,
-  ): ChatCompletionContentPart | undefined {
+  ): ChatCompletionContentPart {
     if (part.type === 'text') {
       return { type: 'text', text: part.content }
     }
@@ -744,7 +1019,9 @@ export class MistralTextAdapter<
       }
     }
 
-    return undefined
+    throw new Error(
+      `Mistral text adapter does not support content part of type '${(part as ContentPart).type}'. Supported types: text, image. Use a vision-capable model (pixtral-large-latest, pixtral-12b-2409, mistral-medium-latest, or mistral-small-latest) for images.`,
+    )
   }
 
   /**

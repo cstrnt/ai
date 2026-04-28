@@ -66,5 +66,5 @@ export function getMistralApiKeyFromEnv(): string {
  * Generates a unique ID with a prefix.
  */
 export function generateId(prefix: string): string {
-  return `${prefix}-${Date.now()}-${Math.random().toString(36).substring(7)}`
+  return `${prefix}-${crypto.randomUUID()}`
 }

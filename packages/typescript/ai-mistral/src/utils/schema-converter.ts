@@ -11,21 +11,22 @@ export function transformNullsToUndefined<T>(obj: T): T {
   }
 
   if (Array.isArray(obj)) {
-    return obj
-      .map((item) => transformNullsToUndefined(item))
-      .filter((item) => item !== undefined) as unknown as T
+    // Preserve array length and indices — converting null elements to
+    // undefined slots rather than dropping them. `Array<T | null>` schemas
+    // depend on positional alignment.
+    return obj.map((item) => transformNullsToUndefined(item)) as unknown as T
   }
 
   if (
     typeof obj === 'object' &&
     Object.getPrototypeOf(obj) === Object.prototype
   ) {
+    // Preserve every key — `null` values become `undefined` values, but the
+    // key itself is not removed. Schemas distinguishing absent vs explicit
+    // null rely on this.
     const result: Record<string, unknown> = {}
     for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
-      const transformed = transformNullsToUndefined(value)
-      if (transformed !== undefined) {
-        result[key] = transformed
-      }
+      result[key] = transformNullsToUndefined(value)
     }
     return result as T
   }

@@ -28,7 +28,7 @@ export const matrix: Record<Feature, Set<Provider>> = {
     'openrouter',
     'mistral',
   ]),
-  reasoning: new Set(['openai', 'anthropic', 'gemini']),
+  reasoning: new Set(['openai', 'anthropic', 'gemini', 'mistral']),
   'multi-turn': new Set([
     'openai',
     'anthropic',
