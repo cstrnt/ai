@@ -46,7 +46,10 @@ console.log(result.text)
 ```typescript
 import { createMistralText } from '@tanstack/ai-mistral'
 
-const adapter = createMistralText('mistral-large-latest', process.env.MISTRAL_API_KEY!)
+const adapter = createMistralText(
+  'mistral-large-latest',
+  process.env.MISTRAL_API_KEY!,
+)
 ```
 
 ## Supported Models
@@ -72,7 +75,7 @@ See [Mistral model comparison](https://docs.mistral.ai/getting-started/models/co
 - ✅ Streaming chat completions
 - ✅ Structured output (JSON Schema)
 - ✅ Function/tool calling
-- ✅ Reasoning (magistral-* models — streamed as `REASONING_*` events)
+- ✅ Reasoning (magistral-_ models — streamed as `REASONING\__` events)
 - ✅ Multimodal input (text + images) — requires a vision-capable model (`pixtral-large-latest`, `pixtral-12b-2409`, `mistral-medium-latest`, or `mistral-small-latest`)
 - ❌ Embeddings (use [@mistralai/mistralai](https://github.com/mistralai/client-ts) directly)
 - ❌ Image generation

@@ -206,10 +206,12 @@ describe('Mistral AG-UI event emission', () => {
     const adapter = createMistralText('mistral-large-latest', 'test-api-key')
     const chunks: Array<StreamChunk> = []
 
-    for await (const chunk of adapter.chatStream(chatOpts({
-      model: 'mistral-large-latest',
-      messages: [{ role: 'user', content: 'Hello' }],
-    }))) {
+    for await (const chunk of adapter.chatStream(
+      chatOpts({
+        model: 'mistral-large-latest',
+        messages: [{ role: 'user', content: 'Hello' }],
+      }),
+    )) {
       chunks.push(chunk)
     }
 
@@ -255,10 +257,12 @@ describe('Mistral AG-UI event emission', () => {
     const adapter = createMistralText('mistral-large-latest', 'test-api-key')
     const chunks: Array<StreamChunk> = []
 
-    for await (const chunk of adapter.chatStream(chatOpts({
-      model: 'mistral-large-latest',
-      messages: [{ role: 'user', content: 'Hello' }],
-    }))) {
+    for await (const chunk of adapter.chatStream(
+      chatOpts({
+        model: 'mistral-large-latest',
+        messages: [{ role: 'user', content: 'Hello' }],
+      }),
+    )) {
       chunks.push(chunk)
     }
 
@@ -309,10 +313,12 @@ describe('Mistral AG-UI event emission', () => {
     const adapter = createMistralText('mistral-large-latest', 'test-api-key')
     const chunks: Array<StreamChunk> = []
 
-    for await (const chunk of adapter.chatStream(chatOpts({
-      model: 'mistral-large-latest',
-      messages: [{ role: 'user', content: 'Hello' }],
-    }))) {
+    for await (const chunk of adapter.chatStream(
+      chatOpts({
+        model: 'mistral-large-latest',
+        messages: [{ role: 'user', content: 'Hello' }],
+      }),
+    )) {
       chunks.push(chunk)
     }
 
@@ -398,11 +404,13 @@ describe('Mistral AG-UI event emission', () => {
     const adapter = createMistralText('mistral-large-latest', 'test-api-key')
     const chunks: Array<StreamChunk> = []
 
-    for await (const chunk of adapter.chatStream(chatOpts({
-      model: 'mistral-large-latest',
-      messages: [{ role: 'user', content: 'Weather in Berlin?' }],
-      tools: [weatherTool],
-    }))) {
+    for await (const chunk of adapter.chatStream(
+      chatOpts({
+        model: 'mistral-large-latest',
+        messages: [{ role: 'user', content: 'Weather in Berlin?' }],
+        tools: [weatherTool],
+      }),
+    )) {
       chunks.push(chunk)
     }
 
@@ -459,10 +467,12 @@ describe('Mistral AG-UI event emission', () => {
     let thrownError: Error | undefined
 
     try {
-      for await (const chunk of adapter.chatStream(chatOpts({
-        model: 'mistral-large-latest',
-        messages: [{ role: 'user', content: 'Hello' }],
-      }))) {
+      for await (const chunk of adapter.chatStream(
+        chatOpts({
+          model: 'mistral-large-latest',
+          messages: [{ role: 'user', content: 'Hello' }],
+        }),
+      )) {
         chunks.push(chunk)
       }
     } catch (err) {
@@ -525,10 +535,12 @@ describe('Mistral AG-UI event emission', () => {
     const adapter = createMistralText('mistral-large-latest', 'test-api-key')
     const chunks: Array<StreamChunk> = []
 
-    for await (const chunk of adapter.chatStream(chatOpts({
-      model: 'mistral-large-latest',
-      messages: [{ role: 'user', content: 'Say hello' }],
-    }))) {
+    for await (const chunk of adapter.chatStream(
+      chatOpts({
+        model: 'mistral-large-latest',
+        messages: [{ role: 'user', content: 'Say hello' }],
+      }),
+    )) {
       chunks.push(chunk)
     }
 
@@ -600,16 +612,15 @@ describe('Mistral AG-UI event emission', () => {
   it('flushes TEXT_MESSAGE_END and RUN_FINISHED when stream ends without finish_reason', async () => {
     // Stream emits content, then [DONE] without ever sending a finish_reason
     // chunk. Consumers must still receive matched lifecycle events.
-    const sseBody =
-      `data: ${JSON.stringify(
-        toApiChunk({
-          id: 'cmpl-cut',
-          model: 'mistral-large-latest',
-          choices: [
-            { index: 0, delta: { content: 'partial' }, finishReason: null },
-          ],
-        }),
-      )}\n\ndata: [DONE]\n\n`
+    const sseBody = `data: ${JSON.stringify(
+      toApiChunk({
+        id: 'cmpl-cut',
+        model: 'mistral-large-latest',
+        choices: [
+          { index: 0, delta: { content: 'partial' }, finishReason: null },
+        ],
+      }),
+    )}\n\ndata: [DONE]\n\n`
 
     vi.stubGlobal(
       'fetch',

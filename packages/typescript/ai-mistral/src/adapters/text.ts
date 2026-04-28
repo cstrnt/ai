@@ -896,7 +896,8 @@ export class MistralTextAdapter<
     return {
       model: options.model,
       messages: messages as ChatCompletionStreamRequest['messages'],
-      temperature: options.temperature ?? modelOptions?.temperature ?? undefined,
+      temperature:
+        options.temperature ?? modelOptions?.temperature ?? undefined,
       maxTokens: options.maxTokens,
       topP: options.topP ?? modelOptions?.top_p ?? undefined,
       tools: tools as ChatCompletionStreamRequest['tools'],
